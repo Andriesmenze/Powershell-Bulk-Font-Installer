@@ -6,7 +6,7 @@ A PowerShell script (`Fonts.ps1`) that installs all fonts from a network share o
 
 1. Creates the working folders `C:\Temp\Fonts\Logs\` and `C:\Temp\Fonts\Files\` if needed.
 2. Starts a log entry in `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log`.
-3. Checks that the script runs as administrator. If not, it logs `E - Run as Administrator` and installs nothing.
+3. Checks that the script runs as administrator. If not, it writes `E - Run as Administrator` to the log and installs nothing. The log folder is created before this check, so the message only reaches the log if the current user can create or write `C:\Temp\Fonts\Logs\` (see [Notes and limitations](#notes-and-limitations)).
 4. Checks that the file server answers (`Test-NetConnection -ComputerName $FileServer`). If not, it logs an error and installs nothing.
 5. Checks that the font source folder exists (`Test-Path`). If not, it logs an error and installs nothing.
 6. Copies the complete content of the source folder to the temporary folder `C:\Temp\Fonts\Files\`.
@@ -109,6 +109,7 @@ Afterwards, check `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log` for the result.
 ## Notes and limitations
 
 - `$FileServer` and `$FontSourceFolder` are independent variables. In the script as shipped, the placeholder values do not match (`Fileserver` and `\\Filserver\Font`), so both must be set.
+- The working folders and the first log lines are written before the administrator check. When the script runs without elevation and the user cannot create `C:\Temp\Fonts\Logs\` (and it does not exist yet), folder creation and logging fail, so the `E - Run as Administrator` message is not written to a log file.
 - The folder creation at the start of the script uses the hardcoded path `C:\Temp\Fonts\`. Changing `$TempFileFolder` or `$LogFile` alone does not change which folders are created.
 - The connectivity check uses `Test-NetConnection` without a port, which is a ping test. If the file server does not answer ping, the script logs an error and installs nothing, even if the share itself is reachable.
 - Only `.ttf`, `.ttc` and `.otf` files are installed. The whole source folder is copied to the temporary folder first, including any other files in it.
