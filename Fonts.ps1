@@ -1,153 +1,245 @@
-﻿# varibles #
-$FileServer        = "Fileserver" # FileServer Hostname #
-$FontSourceFolder  = "\\Filserver\Font" # Font Folder SMB Address #
-$Fonts             = $FontSourceFolder,"\*" -join ""
-$WindowsFontFolder = "C:\Windows\Fonts"
-$TempFileFolder    = "C:\Temp\Fonts\Files\"
-$LogFile           = "C:\Temp\Fonts\Logs\",$env:computername,".log" -join ""
-$RegPath           = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
-$ttf               = "(TrueType)"
-$ttc               = "(TrueType)"
-$otf               = "(OpenType)"
+﻿#Requires -RunAsAdministrator
+
+<#
+.SYNOPSIS
+    Installs all fonts from a network share for all users of this computer.
+
+.DESCRIPTION
+    Searches FontSourceFolder, including its subfolders, for .ttf, .ttc and .otf files. Every
+    font that is not in the Windows Fonts folder yet is copied there straight from the share,
+    and every font is registered under HKLM so it is available to all users after their next
+    sign-in.
+
+    The script must run elevated, for example as a Group Policy computer startup script
+    (SYSTEM) or from an elevated PowerShell session. As SYSTEM the share is accessed with the
+    computer account, so the share and NTFS permissions must allow Domain Computers to read it.
+
+    Every font on the share is installed as SYSTEM on every computer that runs this script, so
+    only administrators should be able to write to the share.
+
+    The log is written to LogFolder\<COMPUTERNAME>.log. The exit code is 0 when every font is
+    installed and 1 when the share can't be reached or anything failed.
+
+.PARAMETER FontSourceFolder
+    UNC path of the folder that holds the fonts. Prefer a fully qualified name or a DFS path
+    (\\fileserver.contoso.com\Fonts) over a short host name.
+
+.PARAMETER LogFolder
+    Folder for the log file. The default can only be written by administrators. Don't use a
+    folder that standard users can write to, such as C:\Temp. If the folder can't be created,
+    for example a share that can't be reached yet, the log goes to the default folder instead.
+
+.PARAMETER WaitForSourceSeconds
+    About how long to keep trying when the share can't be reached yet, for example because the
+    network is still starting during a computer startup script. 0 tries once. One attempt
+    against a server that doesn't answer can take about 20 seconds by itself.
+
+.EXAMPLE
+    .\Fonts.ps1 -FontSourceFolder '\\fileserver.contoso.com\Fonts'
+#>
+[CmdletBinding()]
+param (
+    [ValidateNotNullOrEmpty()]
+    [string]$FontSourceFolder = '\\Fileserver\Font',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$LogFolder = (Join-Path $env:SystemRoot 'Logs\FontInstaller'),
+
+    [ValidateRange(0, 3600)]
+    [int]$WaitForSourceSeconds = 30
+)
+# Variables #
+$WindowsFontFolder = Join-Path $env:SystemRoot 'Fonts'
+$RegPath           = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+$DefaultLogFolder  = Join-Path $env:SystemRoot 'Logs\FontInstaller'
+$LogFolderError    = $null
+$MaxLogSize        = 1MB
+$TempFontPrefix    = '~FontInstaller-'
+$FontTypes         = @{ # File extension and the matching registry value name suffix #
+    '.ttf' = '(TrueType)'
+    '.ttc' = '(TrueType)'
+    '.otf' = '(OpenType)'
+}
 $TotalFonts        = 0
 $SuccessCount      = 0
-$FailerCount       = 0
-# varibles #
+$FailureCount      = 0
+$ExitCode          = 0
+# Variables #
 # Functions #
-Function LogWrite{
-    Param (
-        [string]$logstring
+# Only cmdlets and core types are used, so the script also works in Constrained Language Mode #
+function Write-Log {
+    param (
+        [string]$Message = ''
     )
-    Add-content $Logfile -value $logstring
+    Add-Content -LiteralPath $LogFile -Value $Message -Encoding UTF8
 }
-function Test-Administrator{  
-    $User = [Security.Principal.WindowsIdentity]::GetCurrent();
-    (New-Object Security.Principal.WindowsPrincipal $User).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)  
+function Get-TimeStamp {
+    # ISO 8601, the same on every computer whatever its regional settings #
+    Get-Date -Format 's'
 }
-function Test-RegistryValue{
-    param ( 
-        [parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]$Path,
-        [parameter(Mandatory=$true)]
-        [ValidateNotNullOrEmpty()]$Value
+function Wait-FontSource {
+    # The network may still be starting when this runs as a computer startup script #
+    $Deadline = (Get-Date).AddSeconds($WaitForSourceSeconds)
+    while (-not (Test-Path -LiteralPath $FontSourceFolder -PathType Container)) {
+        if ((Get-Date) -ge $Deadline) {
+            return $false
+        }
+        Start-Sleep -Seconds 5
+    }
+    return $true
+}
+function Get-RegisteredFont {
+    # Registry value name and file (the value data) of every registered font #
+    $Fonts = @{}
+    foreach ($Value in (Get-ItemProperty -LiteralPath $RegPath -ErrorAction Stop).PSObject.Properties) {
+        if ($Value.Name -notin 'PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider') {
+            $Fonts[$Value.Name] = [string]$Value.Value
+        }
+    }
+    $Fonts
+}
+function Install-Font {
+    param (
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$Font
     )
+    $FontName     = $Font.BaseName
+    $NewFontPath  = Join-Path $WindowsFontFolder $Font.Name
+    $RegKeyName   = '{0} {1}' -f $FontName, $FontTypes[$Font.Extension]
+    $IsRegistered = ($Registered.Values -contains $Font.Name) -or ($Registered.Values -contains $NewFontPath)
+
+    if (-not $IsRegistered -and $Registered.ContainsKey($RegKeyName)) {
+        # Never take over a registry value that belongs to another font file #
+        Write-Log "E - Registration $FontName failed: $RegKeyName is already registered for $($Registered[$RegKeyName])"
+        return $false
+    }
+    if (Test-Path -LiteralPath $NewFontPath -PathType Leaf) {
+        Write-Log "i - $FontName Is Already In Windows Font Directory"
+        if ((Get-Item -LiteralPath $NewFontPath).Length -ne $Font.Length) {
+            # A font that is in use can't be replaced, so a changed font is reported instead #
+            Write-Log "i - $FontName Differs From $($Font.FullName) And Is Not Updated"
+        }
+    }
+    else {
+        # A temporary name until the copy is complete, so an interrupted copy never looks installed #
+        $TempFontPath = Join-Path $WindowsFontFolder "$TempFontPrefix$(New-Guid).tmp"
+        try {
+            Copy-Item -LiteralPath $Font.FullName -Destination $TempFontPath -ErrorAction Stop
+            # Windows PowerShell 5.1 doesn't always raise an error when nothing was copied #
+            if ((Get-Item -LiteralPath $TempFontPath -ErrorAction Stop).Length -ne $Font.Length) {
+                throw "The copy of $($Font.FullName) is incomplete"
+            }
+            Move-Item -LiteralPath $TempFontPath -Destination $NewFontPath -ErrorAction Stop
+            Write-Log "S - Copying of $FontName succeeded"
+        }
+        catch {
+            Remove-Item -LiteralPath $TempFontPath -Force -ErrorAction SilentlyContinue
+            Write-Log "E - Copying of $FontName failed: $($_.Exception.Message)"
+            Write-Log "E - Skipping Registration For $FontName"
+            return $false
+        }
+    }
+    if ($IsRegistered) {
+        Write-Log "i - $FontName Is Already Registered"
+        return $true
+    }
     try {
-        Get-ItemProperty -Path $Path | Select-Object -ExpandProperty $Value -ErrorAction Stop | Out-Null
+        $null = New-ItemProperty -LiteralPath $RegPath -Name $RegKeyName -Value $Font.Name -PropertyType String -ErrorAction Stop
+        $Registered[$RegKeyName] = $Font.Name
+        Write-Log "S - Registration $FontName Succeeded"
         return $true
     }
     catch {
+        Write-Log "E - Registration $FontName failed: $($_.Exception.Message)"
         return $false
-    } 
+    }
 }
 # Functions #
-# Prepare Folders #
-If (-not(Test-Path "C:\Temp\")){
-	New-Item -Path "C:\" -Name "Temp" -ItemType "directory" -Force
+# Prepare Log #
+try {
+    $null = New-Item -Path $LogFolder -ItemType Directory -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $LogFolder -PathType Container)) {
+        throw "$LogFolder is not a folder"
+    }
 }
-If (-not(Test-Path "C:\Temp\Fonts\")){
-	New-Item -Path "C:\Temp\" -Name "Fonts" -ItemType "directory"
+catch {
+    # For example a log share that can't be reached yet during a computer startup script #
+    $LogFolderError = "E - Can't use log folder $LogFolder, using $DefaultLogFolder instead: $($_.Exception.Message)"
+    $LogFolder      = $DefaultLogFolder
+    $null = New-Item -Path $LogFolder -ItemType Directory -Force -ErrorAction Stop
 }
-If (-not(Test-Path "C:\Temp\Fonts\Logs\")){
-	New-Item -Path "C:\Temp\Fonts\" -Name "Logs" -ItemType "directory"
+$LogFile = Join-Path $LogFolder "$env:COMPUTERNAME.log"
+if ((Test-Path -LiteralPath $LogFile -PathType Leaf) -and (Get-Item -LiteralPath $LogFile).Length -gt $MaxLogSize) {
+    Move-Item -LiteralPath $LogFile -Destination "$LogFile.old" -Force
 }
-New-Item -Path "C:\Temp\Fonts\" -Name "Files" -ItemType "directory"
-# Prepare Folders #
-# script #
-$Time = Get-Date -Format "MM/dd/yyyy HH:mm"
-LogWrite "$Time - i - Start"
-LogWrite ""
-LogWrite "E - Error"
-LogWrite "S - Success"
-LogWrite "i - Information"
-LogWrite ""
-if (Test-Administrator){
-    if (Test-NetConnection -ComputerName $FileServer -InformationLevel Quiet){
-        if (Test-Path -Path $FontSourceFolder){
-            Copy-Item -Path $Fonts -Destination $TempFileFolder -Recurse
-            Get-ChildItem -Path $Fonts -Include '*.ttf','*.ttc','*.otf' -Recurse | ForEach-Object {
-                $TotalFonts += 1
-                $FontFileName  = $_.Name.ToString()
-                $FontName      = $FontFileName.ToString().Substring(0, $FontFileName.Length-4)
-                $LocalFontPath = $TempFileFolder,$FontFileName -join "\"
-                $NewFontPath = $WindowsFontFolder,$FontFileName -join "\"
-                LogWrite "i - $FontName"
-                if ($FontFileName -like "*.ttf"){
-                    $FileType = $ttf
-                }
-                elseif ($FontFileName -like "*.ttc") {
-                    $FileType = $ttc    
-                }
-                elseif ($FontFileName -like "*.otf") {
-                    $FileType = $otf        
-                }
-                $RegKeyName = $FontName,$FileType -join " "
-                $RegKeyValue = $FontFileName
-                if (Test-Path -Path $NewFontPath -PathType Leaf){
-                    LogWrite "i - $FontName Is Already In Windows Font Directory"
-                    if(Test-RegistryValue -Path $RegPath -Value $RegKeyName){
-                        LogWrite "i - $FontName Is Already Registered"
-                        $SuccessCount += 1
-                    }
-                    else{
-                        Try{
-                            $null = New-ItemProperty -Path $RegPath -Name $RegKeyname -Value $RegKeyValue -PropertyType String -Force -ErrorAction Stop
-                            LogWrite "S - Registration $FontName Succeeded"
-                            $SuccessCount += 1
-                        }
-                        Catch{
-                            LogWrite "E - Registration $FontName failed!"
-                            $FailerCount =+ 1
-                        }
-                    }
-                }
-                else{
-                    try{
-                            Copy-Item -Path $LocalFontPath -Destination $WindowsFontFolder -Force -ErrorAction Stop 
-                            LogWrite "S - Copying of $FontName succeeded"
-                        if(Test-RegistryValue -Path $RegPath -Value $RegKeyName){
-                            LogWrite "i - $FontName Is Already Registered"
-                            $SuccessCount += 1
-                        }
-                        else{
-                            Try{
-                                $null = New-ItemProperty -Path $RegPath -Name $RegKeyname -Value $RegKeyValue -PropertyType String -Force -ErrorAction Stop
-                                LogWrite "S - Registration $FontName Succeeded"
-                                $SuccessCount += 1
-                            }
-                            Catch{
-                                LogWrite "E - Registration $FontName failed!"
-                                $FailerCount += 1
-                            }
-                        }
-                    }
-                    Catch{
-                        LogWrite "E - Copying of $FontName failed!"
-                        LogWrite "E - Skipping Registration For $FontName"
-                        $FailerCount += 1
-                    }
-                }
-                LogWrite ""
+# Prepare Log #
+# Script #
+Write-Log "$(Get-TimeStamp) - i - Start"
+Write-Log ''
+Write-Log 'E - Error'
+Write-Log 'S - Success'
+Write-Log 'i - Information'
+Write-Log ''
+Write-Log "i - Running As $env:USERDOMAIN\$env:USERNAME"
+Write-Log "i - Font Source $FontSourceFolder"
+Write-Log ''
+if ($LogFolderError) {
+    Write-Log $LogFolderError
+    Write-Log ''
+    $ExitCode = 1
+}
+# Leftovers of copies that were interrupted, for example when a script timeout ended the run #
+Get-ChildItem -LiteralPath $WindowsFontFolder -Filter "$TempFontPrefix*.tmp" -File |
+    Where-Object { $_.CreationTime -lt (Get-Date).AddHours(-1) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+if (Wait-FontSource) {
+    # macOS metadata files (._Name.ttf) have font extensions but aren't fonts #
+    $FontFiles = Get-ChildItem -LiteralPath $FontSourceFolder -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable ListErrors |
+        Where-Object { $FontTypes.ContainsKey($_.Extension) -and $_.Name -notlike '._*' } |
+        Sort-Object DirectoryName, Name
+    foreach ($ListError in $ListErrors) {
+        Write-Log "E - Can't read $($ListError.TargetObject): $($ListError.Exception.Message)"
+        $ExitCode = 1
+    }
+    if (-not $FontFiles) {
+        Write-Log "i - No fonts found in $FontSourceFolder"
+        Write-Log ''
+    }
+    $Registered = Get-RegisteredFont
+    $Handled    = @{} # File name and the full path of the font that was handled under that name #
+    foreach ($Font in $FontFiles) {
+        $TotalFonts += 1
+        Write-Log "i - $($Font.BaseName)"
+        if ($Handled.ContainsKey($Font.Name)) {
+            # The Windows Fonts folder is flat, so only one font per file name can be installed #
+            Write-Log "E - Skipping $($Font.FullName), it has the same file name as $($Handled[$Font.Name])"
+            $FailureCount += 1
+        }
+        else {
+            $Handled[$Font.Name] = $Font.FullName
+            if (Install-Font -Font $Font) {
+                $SuccessCount += 1
+            }
+            else {
+                $FailureCount += 1
             }
         }
-        else{
-        LogWrite "E - Can't find the folder $FontSourceFolder"
-        LogWrite ""
-        }
-    }
-    else{
-    LogWrite "E - Can't contact the FileServer $FileServer"
-    LogWrite ""
+        Write-Log ''
     }
 }
-else{
-    LogWrite "E - Run as Administrator"
-    LogWrite ""
+else {
+    Write-Log "E - Can't access $FontSourceFolder (server unreachable, folder missing or access denied)"
+    Write-Log ''
+    $ExitCode = 1
 }
-Remove-Item $TempFileFolder -Recurse -Force
-LogWrite "Total Fonts = $TotalFonts"
-LogWrite "Successful Fonts = $SuccessCount"
-LogWrite "Failed Fonts = $FailerCount"
-LogWrite ""
-$Time = Get-Date -Format "MM/dd/yyyy HH:mm"
-LogWrite "$Time - i - End"
-# script #
+if ($FailureCount -gt 0) {
+    $ExitCode = 1
+}
+Write-Log "Total Fonts = $TotalFonts"
+Write-Log "Successful Fonts = $SuccessCount"
+Write-Log "Failed Fonts = $FailureCount"
+Write-Log ''
+Write-Log "$(Get-TimeStamp) - i - End"
+Write-Output "Fonts: $TotalFonts total, $SuccessCount successful, $FailureCount failed. Log: $LogFile"
+exit $ExitCode
+# Script #
