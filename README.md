@@ -4,18 +4,18 @@ A PowerShell script (`Fonts.ps1`) that installs all fonts from a network share o
 
 ## What it does
 
-1. Creates the working folders `C:\Temp\Fonts\Logs\` and `C:\Temp\Fonts\Files\` if needed.
-2. Starts a log entry in `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log`.
-3. Checks that the script runs as administrator. If not, it writes `E - Run as Administrator` to the log and installs nothing. The log folder is created before this check, so the message only reaches the log if the current user can create or write `C:\Temp\Fonts\Logs\` (see [Notes and limitations](#notes-and-limitations)).
-4. Checks that the file server answers (`Test-NetConnection -ComputerName $FileServer`). If not, it logs an error and installs nothing.
-5. Checks that the font source folder exists (`Test-Path`). If not, it logs an error and installs nothing.
-6. Copies the complete content of the source folder to the temporary folder `C:\Temp\Fonts\Files\`.
-7. Searches the source folder recursively for `*.ttf`, `*.ttc` and `*.otf` files and handles each file as follows:
-   - If a file with the same name already exists in `C:\Windows\Fonts`, the file is not copied again.
-   - Otherwise the file is copied from the temporary folder to `C:\Windows\Fonts`. If the copy fails, registration is skipped for that font.
-   - If the registry value for the font does not exist yet under `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts`, it is created as a string value. If it already exists, it is left unchanged.
-8. Deletes the temporary folder `C:\Temp\Fonts\Files\`.
-9. Writes the totals (total, successful and failed fonts) and an end timestamp to the log.
+1. Checks that it runs elevated (`#Requires -RunAsAdministrator`). Without elevation PowerShell stops before the script does anything: it prints an error, returns exit code `1` and writes no log.
+2. Creates the log folder (default `C:\Windows\Logs\FontInstaller`) and starts a log entry in `<COMPUTERNAME>.log`. If the log folder can't be created, for example a share that isn't reachable yet, the log goes to the default folder instead and the problem is logged as an error. A log larger than 1 MB is first renamed to `<COMPUTERNAME>.log.old`.
+3. Waits until the font source folder can be reached, for about `-WaitForSourceSeconds` (default 30 seconds). This covers computer startup scripts that run before the network is ready. If the folder still can't be reached, it logs an error and installs nothing.
+4. Searches the source folder and its subfolders for `.ttf`, `.ttc` and `.otf` files, skipping macOS metadata files (`._Name.ttf`). Fonts in the source folder itself come first, then the fonts in subfolders. Each file is handled as follows:
+   - If an earlier font had the same file name, the file is skipped and counted as failed. `C:\Windows\Fonts` has no subfolders, so only one font per file name can be installed.
+   - If the font file isn't registered yet but its registry value name (see below) is already used for a different file, the font is skipped and counted as failed. The existing value is left alone.
+   - If a file with the same name already exists in `C:\Windows\Fonts`, it is not copied again. If its size differs from the file on the share, the log says so.
+   - Otherwise the file is copied straight from the share to `C:\Windows\Fonts`, under a temporary name (`~FontInstaller-<id>.tmp`) that is renamed once the copy is complete. If the copy fails, the temporary file is removed, the error is logged and registration is skipped.
+   - If the font file is already registered under `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts`, under any value name, nothing changes. Otherwise a string value is created.
+5. Writes the totals and an end timestamp to the log, prints a one-line summary and exits with code `0` when everything succeeded, or `1` when anything failed.
+
+Temporary files left behind by a run that was stopped in the middle of a copy are removed by a later run once they are more than an hour old.
 
 ### Registry entries
 
@@ -27,9 +27,11 @@ The registry value name is built from the file name without its extension plus a
 | `.ttc`    | `(TrueType)` | `MyFont (TrueType)`     | `MyFont.ttc`       |
 | `.otf`    | `(OpenType)` | `MyFont (OpenType)`     | `MyFont.otf`       |
 
+A font file that is already registered under another name, for example because it was installed through Windows Settings, keeps that registration and doesn't get a second value.
+
 ### Logging
 
-Status messages are written to `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log`. The script appends to this file, so it contains the history of all runs. Each line is prefixed with a level:
+Status messages are written to `C:\Windows\Logs\FontInstaller\<COMPUTERNAME>.log` (UTF-8). The script appends to this file, so it contains the history of all runs, until it grows past 1 MB and is renamed to `<COMPUTERNAME>.log.old`. Each line is prefixed with a level:
 
 - `E`: Error
 - `S`: Success
@@ -38,11 +40,14 @@ Status messages are written to `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log`. The scri
 Example:
 
 ```text
-10/02/2026 14:30 - i - Start
+2026-10-02T14:30:05 - i - Start
 
 E - Error
 S - Success
 i - Information
+
+i - Running As CONTOSO\PC01$
+i - Font Source \\fs01.contoso.com\Fonts
 
 i - MyFont
 S - Copying of MyFont succeeded
@@ -52,73 +57,76 @@ Total Fonts = 1
 Successful Fonts = 1
 Failed Fonts = 0
 
-10/02/2026 14:30 - i - End
+2026-10-02T14:30:06 - i - End
 ```
 
-A font that is already present and already registered is logged as information and counted as successful.
+When the script runs as SYSTEM, `Running As` shows the computer account (`PC01$`), which is the account that needs read access to the share. Error lines include the reason, for example `E - Copying of MyFont failed: Access to the path ... is denied.` A font that is already present and already registered is logged as information and counted as successful.
 
 ## Requirements
 
-- Windows
-- PowerShell with the `Test-NetConnection` cmdlet available
-- Administrator rights (the script checks this and stops without installing anything if they are missing)
-- A file server with a shared folder that contains the font files, reachable from the computer
-- Write access to `C:\` (the script creates `C:\Temp\Fonts\`)
+- Windows with Windows PowerShell 5.1 or PowerShell 7
+- Administrator rights, or running as SYSTEM, for example as a Group Policy computer startup script
+- A shared folder with the font files that the account running the script can read. A computer startup script runs as SYSTEM and reaches the share with the computer account, so give `Domain Computers` read access on both the share and the folder.
+
+The script only uses what PowerShell allows in Constrained Language Mode, so it also works where App Control for Business (WDAC) or AppLocker runs unsigned scripts in that mode.
+
+## Security
+
+The script installs every font on the share, as SYSTEM, on every computer that runs it. Treat the share accordingly:
+
+- Only administrators should be able to write to the share.
+- Use a fully qualified server name or a DFS path (`\\fs01.contoso.com\Fonts`) instead of a short name like `\\Fileserver\Font`. Short names that don't resolve in DNS fall back to broadcast name resolution, which anyone on the network can answer.
+- Keep the log folder writable for administrators only. The default under `C:\Windows\Logs` is. Don't point `-LogFolder` at a folder like `C:\Temp`, where standard users can create and change files.
 
 ## Usage
 
-The script has no parameters. Edit the variables at the top of `Fonts.ps1` before running it:
+Run the script from an elevated PowerShell session (Run as administrator) and pass your share:
 
 ```powershell
-$FileServer        = "Fileserver" # FileServer Hostname #
-$FontSourceFolder  = "\\Filserver\Font" # Font Folder SMB Address #
-```
-
-Set both to your own values, for example:
-
-```powershell
-$FileServer        = "fs01"
-$FontSourceFolder  = "\\fs01\Fonts"
-```
-
-Then run the script from an elevated PowerShell session (Run as administrator):
-
-```powershell
-.\Fonts.ps1
+.\Fonts.ps1 -FontSourceFolder '\\fs01.contoso.com\Fonts'
 ```
 
 If script execution is blocked by the execution policy on your system, you can bypass it for a single run:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Fonts.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\Fonts.ps1 -FontSourceFolder "\\fs01.contoso.com\Fonts"
 ```
 
-Afterwards, check `C:\Temp\Fonts\Logs\<COMPUTERNAME>.log` for the result.
+As a Group Policy computer startup script, add `Fonts.ps1` on the **PowerShell Scripts** tab of the startup script settings and enter `-FontSourceFolder \\fs01.contoso.com\Fonts` as the script parameters. You can also change the default value of `$FontSourceFolder` in the `param` block at the top of the script.
 
-## Variables
+Afterwards, check `C:\Windows\Logs\FontInstaller\<COMPUTERNAME>.log` or the exit code for the result. New fonts appear for users at their next sign-in.
 
-| Variable             | Default                                    | Description                                                                 |
-|----------------------|--------------------------------------------|-----------------------------------------------------------------------------|
-| `$FileServer`        | `"Fileserver"`                             | Host name of the file server, used only for the connectivity check. Must be edited. |
-| `$FontSourceFolder`  | `"\\Filserver\Font"`                       | UNC path of the folder that contains the fonts. Must be edited.             |
-| `$WindowsFontFolder` | `"C:\Windows\Fonts"`                       | Folder the fonts are copied to.                                             |
-| `$TempFileFolder`    | `"C:\Temp\Fonts\Files\"`                   | Temporary local copy of the source folder. Deleted at the end of the run.   |
-| `$LogFile`           | `"C:\Temp\Fonts\Logs\<COMPUTERNAME>.log"`  | Log file, named after the computer (`$env:computername`).                   |
-| `$RegPath`           | `"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"` | Registry key in which the fonts are registered.           |
+`Get-Help .\Fonts.ps1 -Full` shows the built-in help.
+
+## Parameters
+
+| Parameter               | Default                          | Description                                                                 |
+|-------------------------|----------------------------------|-----------------------------------------------------------------------------|
+| `-FontSourceFolder`     | `\\Fileserver\Font`              | UNC path of the folder that contains the fonts. Set it to your own share.   |
+| `-LogFolder`            | `C:\Windows\Logs\FontInstaller`  | Folder for the log file `<COMPUTERNAME>.log`. Must not be writable by standard users. If it can't be created, the default folder is used. |
+| `-WaitForSourceSeconds` | `30`                             | About how long to keep trying to reach the source folder. `0` tries once. One attempt against a server that doesn't answer can take about 20 seconds by itself. |
+
+## Exit codes
+
+| Code | Meaning                                                                 |
+|------|-------------------------------------------------------------------------|
+| `0`  | Every font was installed or was already installed.                      |
+| `1`  | The source folder couldn't be reached or read, the log folder couldn't be used, or at least one font failed; details are in the log. Also returned when the script isn't elevated, in which case PowerShell refuses to run it and there is no log. |
 
 ## Notes and limitations
 
-- `$FileServer` and `$FontSourceFolder` are independent variables. In the script as shipped, the placeholder values do not match (`Fileserver` and `\\Filserver\Font`), so both must be set.
-- The working folders and the first log lines are written before the administrator check. When the script runs without elevation and the user cannot create `C:\Temp\Fonts\Logs\` (and it does not exist yet), folder creation and logging fail, so the `E - Run as Administrator` message is not written to a log file.
-- The folder creation at the start of the script uses the hardcoded path `C:\Temp\Fonts\`. Changing `$TempFileFolder` or `$LogFile` alone does not change which folders are created.
-- The connectivity check uses `Test-NetConnection` without a port, which is a ping test. If the file server does not answer ping, the script logs an error and installs nothing, even if the share itself is reachable.
-- Only `.ttf`, `.ttc` and `.otf` files are installed. The whole source folder is copied to the temporary folder first, including any other files in it.
-- Fonts in subfolders of the source folder are found by the recursive search, but the script expects every font file directly in the root of the temporary folder. Fonts in subfolders therefore fail at the copy step unless a file with the same name already exists in `C:\Windows\Fonts`. Keep all font files in the root of the source folder.
 - The registry value name is derived from the file name, not from the font name stored inside the font file.
-- "Already installed" is decided by file name only. An existing file with the same name in `C:\Windows\Fonts` is never overwritten, so the script does not update fonts.
-- The script only copies files and writes registry values. It does not notify running applications of new fonts.
-- The failure counter is not reliable in one case: when registration fails for a font whose file was already present in `C:\Windows\Fonts`, the counter is set to 1 instead of being increased (`$FailerCount =+ 1`).
-- Timestamps in the log use the format `MM/dd/yyyy HH:mm`.
+- Fonts that are already in `C:\Windows\Fonts` are never replaced, because Windows locks fonts that are in use. If the version on the share has a different size, the log says so. To roll out a new version of a font, give the file a new name.
+- Removing a font from the share doesn't remove it from the computers.
+- Fonts with the same file name in different subfolders of the share can't all be installed. Only the first one found is; the others are logged as errors.
+- The script copies files and writes registry values. It doesn't notify running applications, so a new font appears in sessions that start after the installation (the next sign-in).
+- Only `.ttf`, `.ttc` and `.otf` files are installed. Other files on the share are ignored.
+- Run the script through one deployment method at a time (for example Group Policy or Intune, not both). Overlapping runs don't damage the installation, but they can report errors and mix up each other's log lines.
+
+### Upgrading from the old version
+
+- Earlier versions had the share hardcoded in two variables at the top of the script (`$FileServer` and `$FontSourceFolder`). Pass your share with `-FontSourceFolder` or set it as the default in the `param` block; otherwise the script looks for `\\Fileserver\Font`.
+- Earlier versions used `C:\Temp\Fonts\` for a temporary copy of the share and for the log. That folder isn't used anymore and can be deleted.
 
 ## License
 
